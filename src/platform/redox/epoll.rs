@@ -124,6 +124,7 @@ impl PalEpoll for Sys {
         }?;
 
         let read = bytes_read as usize / mem::size_of::<syscall::Event>();
+        assert!(read <= events.len());
 
         let events_ptr = events.as_mut_ptr();
         let mut count = 0;
