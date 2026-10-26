@@ -101,18 +101,23 @@ impl MmapFile {
     }
 
     fn from_fd(fd: i32, size: usize) -> core::result::Result<Self, Errno> {
-        let ptr = unsafe {
-            Sys::mmap(
-                ptr::null_mut(),
-                size,
-                sys_mman::PROT_READ,
-                sys_mman::MAP_PRIVATE,
-                fd,
-                0,
-            )
-        }?;
-
-        Ok(Self { fd, ptr, size })
+        // Read the file into anonymous memory instead of mapping it. On
+        // aarch64, file mappings from redoxfs sometimes show corrupted
+        // contents (redox-rpi docs/debugging-random-crashes.md).
+        let anonymous = Self::anonymous(size.max(1))?;
+        let ptr = anonymous.ptr;
+        core::mem::forget(anonymous);
+        let this = Self { fd, ptr, size };
+        let buf = this.as_mut_slice();
+        let mut done = 0;
+        while done < size {
+            let offset = done.try_into().map_err(|_| Errno(crate::header::errno::EOVERFLOW))?;
+            match Sys::pread(fd, &mut buf[done..], offset)? {
+                0 => break,
+                n => done += n,
+            }
+        }
+        Ok(this)
     }
 
     fn anonymous(size: usize) -> core::result::Result<Self, Errno> {
