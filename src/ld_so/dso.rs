@@ -716,6 +716,7 @@ impl DSO {
                     0,
                 )
                 .map_err(|e| format!("failed to map {}. errno: {}", path, e.0))?;
+                populate(ptr.cast::<u8>(), size);
 
                 if !(start as *mut c_void).is_null() {
                     assert_eq!(
@@ -1672,3 +1673,15 @@ pub unsafe fn apply_relr(base: *const u8, relr: &[Relr]) {
 // TODO: Add safety comment.
 unsafe impl Send for DSO {}
 unsafe impl Sync for DSO {}
+
+/// Touch every page of fresh anonymous memory once, before it is written.
+///
+/// Workaround (redox-rpi, docs/debugging-random-crashes.md): on aarch64,
+/// programs whose segments were copied into memory that was populated
+/// lazily, page by page during the copy, sometimes started with corrupted
+/// state. Reading each page first avoids it; the kernel cause is not found yet.
+pub(crate) fn populate(ptr: *const u8, len: usize) {
+    for offset in (0..len).step_by(4096) {
+        unsafe { ptr.add(offset).read_volatile() };
+    }
+}
