@@ -716,7 +716,7 @@ impl DSO {
                     0,
                 )
                 .map_err(|e| format!("failed to map {}. errno: {}", path, e.0))?;
-                populate(ptr.cast::<u8>(), size);
+                diag_check_zeroed(path, ptr.cast::<u8>(), size);
 
                 if !(start as *mut c_void).is_null() {
                     assert_eq!(
@@ -817,6 +817,7 @@ impl DSO {
                         .dynamic(endian, data)
                         .map_err(|err| err.to_string())?
                         .ok_or_else(|| "Unable to parse PT_DYNAMIC section".to_string())?;
+                    diag_check_dynamic(path, data, ph.p_offset(endian).into(), entries);
                     dynamic = Some((ph, entries));
                 }
                 _ => (),
@@ -1684,4 +1685,182 @@ pub(crate) fn populate(ptr: *const u8, len: usize) {
     for offset in (0..len).step_by(4096) {
         unsafe { ptr.add(offset).read_volatile() };
     }
+}
+
+/// redox-rpi diagnostic (docs/debugging-random-crashes.md): programs
+/// sometimes fail with a PT_DYNAMIC that lacks entries. If it looks broken,
+/// print it, then read the whole file again and report where the buffer we
+/// parsed differs from it.
+fn diag_check_dynamic(path: &str, data: &[u8], dyn_offset: u64, entries: &[Dyn]) {
+    let tag_of = |e: &Dyn| e.d_tag(NativeEndian) as u32;
+    let val_of = |e: &Dyn| e.d_val(NativeEndian) as u64;
+    let has = |t: u32| entries.iter().any(|e| tag_of(e) == t);
+    let ent_is = |t: u32, size: usize| {
+        entries
+            .iter()
+            .all(|e| tag_of(e) != t || val_of(e) == size as u64)
+    };
+
+    let mut problems = String::new();
+    for (ptr_tag, size_tag) in [
+        (elf::DT_RELA, elf::DT_RELASZ),
+        (elf::DT_REL, elf::DT_RELSZ),
+        (DT_RELR, DT_RELRSZ),
+        (elf::DT_INIT_ARRAY, elf::DT_INIT_ARRAYSZ),
+        (elf::DT_FINI_ARRAY, elf::DT_FINI_ARRAYSZ),
+        (elf::DT_STRTAB, elf::DT_STRSZ),
+    ] {
+        if has(ptr_tag) != has(size_tag) {
+            problems += &format!(" pair {}/{}", ptr_tag, size_tag);
+        }
+    }
+    if !has(elf::DT_STRTAB) {
+        problems += " no-strtab";
+    }
+    if !has(elf::DT_GNU_HASH) && !has(elf::DT_HASH) {
+        problems += " no-hash";
+    }
+    if !ent_is(elf::DT_RELAENT, size_of::<Rela>()) {
+        problems += " relaent";
+    }
+    if !ent_is(elf::DT_SYMENT, size_of::<Sym>()) {
+        problems += " syment";
+    }
+    if problems.is_empty() {
+        return;
+    }
+
+    let entries_addr = entries.as_ptr() as usize;
+    eprintln!(
+        "[ld.so diag] {}: broken PT_DYNAMIC:{}",
+        path, problems
+    );
+    eprintln!(
+        "[ld.so diag] buffer {:#x} len {:#x}, dynamic at file {:#x} (page off {:#x}), addr {:#x}, {} entries",
+        data.as_ptr() as usize,
+        data.len(),
+        dyn_offset,
+        dyn_offset & 0xfff,
+        entries_addr,
+        entries.len()
+    );
+
+    let Ok(path_c) = crate::c_str::CString::new(path) else {
+        return;
+    };
+    let flags = crate::header::fcntl::O_RDONLY | crate::header::fcntl::O_CLOEXEC;
+    let fd = match Sys::open(crate::c_str::CStr::borrow(&path_c), flags, 0) {
+        Ok(fd) => fd,
+        Err(err) => {
+            eprintln!("[ld.so diag] reopen failed: {}", err.0);
+            return;
+        }
+    };
+
+    // The entries as parsed, next to the same bytes read from the file again.
+    let entry_size = size_of::<Dyn>();
+    for (i, entry) in entries.iter().enumerate() {
+        let mut raw = [0u8; 16];
+        let raw = &mut raw[..entry_size];
+        let off = dyn_offset as usize + i * entry_size;
+        let file = match Sys::pread(fd, raw, off as _) {
+            Ok(n) if n == entry_size => {
+                let half = entry_size / 2;
+                let mut t = [0u8; 8];
+                let mut v = [0u8; 8];
+                t[..half].copy_from_slice(&raw[..half]);
+                v[..half].copy_from_slice(&raw[half..]);
+                Some((u64::from_le_bytes(t), u64::from_le_bytes(v)))
+            }
+            _ => None,
+        };
+        let mem = (tag_of(entry) as u64, val_of(entry));
+        match file {
+            Some(f) if f.0 as u32 as u64 == mem.0 && f.1 == mem.1 => eprintln!(
+                "[ld.so diag]  {:2} {:#x} {:#x}",
+                i, mem.0, mem.1
+            ),
+            Some(f) => eprintln!(
+                "[ld.so diag]  {:2} {:#x} {:#x}  FILE {:#x} {:#x}",
+                i, mem.0, mem.1, f.0, f.1
+            ),
+            None => eprintln!(
+                "[ld.so diag]  {:2} {:#x} {:#x}  FILE ?",
+                i, mem.0, mem.1
+            ),
+        }
+    }
+
+    // Compare the whole buffer with the file.
+    let mut buf = vec![0u8; 0x10000];
+    let mut off = 0;
+    let mut diff_start: Option<usize> = None;
+    let mut ranges = 0;
+    let mut report = |start: usize, end: usize| {
+        if ranges < 16 {
+            eprintln!(
+                "[ld.so diag] differs {:#x}..{:#x} ({:#x} bytes, pages {:#x}..={:#x}, addr {:#x})",
+                start,
+                end,
+                end - start,
+                start >> 12,
+                (end - 1) >> 12,
+                data.as_ptr() as usize + start
+            );
+        }
+        ranges += 1;
+    };
+    while off < data.len() {
+        let want = (data.len() - off).min(buf.len());
+        let n = match Sys::pread(fd, &mut buf[..want], off as _) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        for i in 0..n {
+            let same = buf[i] == data[off + i];
+            match (same, diff_start) {
+                (false, None) => diff_start = Some(off + i),
+                (true, Some(start)) => {
+                    report(start, off + i);
+                    diff_start = None;
+                }
+                _ => {}
+            }
+        }
+        off += n;
+    }
+    if let Some(start) = diff_start {
+        report(start, off);
+    }
+    eprintln!(
+        "[ld.so diag] compared {:#x} of {:#x} bytes, {} differing ranges",
+        off,
+        data.len(),
+        ranges
+    );
+    let _ = Sys::close(fd);
+}
+
+/// redox-rpi diagnostic: fresh anonymous memory must read as zero. If it
+/// does not, the kernel's shared zero page (or a recycled frame) is dirty.
+pub(crate) fn diag_check_zeroed(what: &str, ptr: *const u8, len: usize) {
+    let mem = unsafe { slice::from_raw_parts(ptr, len) };
+    let Some(first) = mem.iter().position(|&b| b != 0) else {
+        return;
+    };
+    let pages = mem
+        .chunks(4096)
+        .filter(|page| page.iter().any(|&b| b != 0))
+        .count();
+    let end = (first + 32).min(len);
+    eprintln!(
+        "[ld.so diag] {}: fresh memory {:#x} len {:#x} NOT ZERO: first at {:#x}, {} of {} pages dirty, bytes {:02x?}",
+        what,
+        ptr as usize,
+        len,
+        first,
+        pages,
+        len.div_ceil(4096),
+        &mem[first..end]
+    );
 }

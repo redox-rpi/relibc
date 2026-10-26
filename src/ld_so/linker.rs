@@ -106,7 +106,7 @@ impl MmapFile {
         // contents (redox-rpi docs/debugging-random-crashes.md).
         let anonymous = Self::anonymous(size.max(1))?;
         let ptr = anonymous.ptr;
-        super::dso::populate(ptr.cast::<u8>(), size);
+        super::dso::diag_check_zeroed("read buffer", ptr.cast::<u8>(), size);
         core::mem::forget(anonymous);
         let this = Self { fd, ptr, size };
         let buf = this.as_mut_slice();
