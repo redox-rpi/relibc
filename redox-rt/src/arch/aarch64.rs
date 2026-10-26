@@ -369,8 +369,10 @@ asmfunction!(__relibc_internal_sigentry: ["
     mrs x3, nzcv
     stp x2, x3, [sp, #-16]!
 
+    // x2 goes below x1 (ArchIntRegs order, and `ldp x2, x1` below), like
+    // the other pairs.
     ldp x2, x3, [x0, #{tcb_sa_off} + {sa_tmp_x1_x2}]
-    stp x2, x3, [sp, #-16]!
+    stp x3, x2, [sp, #-16]!
     ldp x3, x4, [x0, #{tcb_sa_off} + {sa_tmp_x3_x4}]
     stp x4, x3, [sp, #-16]!
     ldp x5, x6, [x0, #{tcb_sa_off} + {sa_tmp_x5_x6}]
