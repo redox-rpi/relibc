@@ -111,14 +111,21 @@ unsafe extern "C" fn child_hook(scratchpad: &ForkScratchpad) {
 }
 
 asmfunction!(__relibc_internal_fork_wrapper (usize) -> usize: ["
+    // The callee-saved part of the floating point registers, d8-d15, goes on
+    // the stack with the integer registers, so that the child, which starts
+    // at __relibc_internal_fork_ret on a copy of this stack, gets them too.
+    // Otherwise the child continues with whatever these registers held on
+    // its CPU, and corrupts values the compiler kept in them across the call.
+    stp     d14, d15, [sp, #-16]!
+    stp     d12, d13, [sp, #-16]!
+    stp     d10, d11, [sp, #-16]!
+    stp     d8, d9, [sp, #-16]!
     stp     x29, x30, [sp, #-16]!
     stp     x27, x28, [sp, #-16]!
     stp     x25, x26, [sp, #-16]!
     stp     x23, x24, [sp, #-16]!
     stp     x21, x22, [sp, #-16]!
     stp     x19, x20, [sp, #-16]!
-
-    //TODO: store floating point regs
 
     // x0: &ForkArgs
     mov x1, sp
@@ -130,6 +137,10 @@ asmfunction!(__relibc_internal_fork_wrapper (usize) -> usize: ["
     ldp     x25, x26, [sp], #16
     ldp     x27, x28, [sp], #16
     ldp     x29, x30, [sp], #16
+    ldp     d8, d9, [sp], #16
+    ldp     d10, d11, [sp], #16
+    ldp     d12, d13, [sp], #16
+    ldp     d14, d15, [sp], #16
     ret
 "] <= [fork_impl = sym fork_impl]);
 
@@ -139,8 +150,6 @@ asmfunction!(__relibc_internal_fork_ret: ["
 
     bl {child_hook}
 
-    //TODO: load floating point regs
-
     mov x0, xzr
 
     ldp     x19, x20, [sp], #16
@@ -149,6 +158,10 @@ asmfunction!(__relibc_internal_fork_ret: ["
     ldp     x25, x26, [sp], #16
     ldp     x27, x28, [sp], #16
     ldp     x29, x30, [sp], #16
+    ldp     d8, d9, [sp], #16
+    ldp     d10, d11, [sp], #16
+    ldp     d12, d13, [sp], #16
+    ldp     d14, d15, [sp], #16
 
     ret
 "] <= [child_hook = sym child_hook]);
