@@ -20,11 +20,9 @@ pub const STACK_SIZE: usize = 1024 * 1024;
 pub struct SigArea {
     pub altstack_top: usize,
     pub altstack_bottom: usize,
-    pub tmp_x1_x2: [usize; 2],
-    pub tmp_x3_x4: [usize; 2],
-    pub tmp_x5_x6: [usize; 2],
-    pub tmp_x7_x8: [usize; 2],
-    pub tmp_sp: usize,
+    /// x1-x8 and sp of the interrupted code while the signal entry picks a
+    /// signal; only these fields of `tmp` are used.
+    pub tmp: ArchIntRegs,
     pub onstack: u64,
     pub disable_signals_depth: u64,
     pub pctl: usize, // TODO: remove
@@ -166,6 +164,43 @@ asmfunction!(__relibc_internal_fork_ret: ["
     ret
 "] <= [child_hook = sym child_hook]);
 
+/// Floating point and SIMD registers as the signal entry saves them, right
+/// above the `SigStack` on the stack.
+#[repr(C)]
+pub struct ArchFpRegs {
+    pub q: [u128; 32],
+    pub fpcr: usize,
+    pub fpsr: usize,
+}
+
+/// One load or store per register, each at the offset of the field with the
+/// same name: `each_reg!("str", "sp, #"; x9 x10)` becomes
+/// `str x9, [sp, #{x9}]` and `str x10, [sp, #{x10}]`, where the operand
+/// `{x9}` is `offset_of!(ArchIntRegs, x9)`. So a register can only go into
+/// its own field, whatever the order of the fields.
+macro_rules! each_reg {
+    ($op:literal, $base:literal; $($reg:ident)*) => {
+        concat!($(
+            "    ", $op, " ", stringify!($reg), ", [", $base, "{", stringify!($reg), "}]\n",
+        )*)
+    };
+}
+
+/// Copies fields from one `ArchIntRegs` to another through x2.
+macro_rules! copy_regs {
+    ($from:literal => $to:literal; $($reg:ident)*) => {
+        concat!($(
+            "    ldr x2, [", $from, "{", stringify!($reg), "}]\n",
+            "    str x2, [", $to, "{", stringify!($reg), "}]\n",
+        )*)
+    };
+}
+
+/// Defines `__relibc_internal_sigentry`. `$reg` are the registers that the
+/// signal entry keeps untouched until it saves them into the `ArchIntRegs`
+/// and that it restores last; it saves and restores them from this one list.
+macro_rules! sigentry {
+    ($($reg:ident)*) => {
 // https://devblogs.microsoft.com/oldnewthing/20220811-00/?p=106963
 asmfunction!(__relibc_internal_sigentry: ["
     // Clear any active reservation.
@@ -175,13 +210,13 @@ asmfunction!(__relibc_internal_sigentry: ["
     mrs x0, tpidr_el0 // ABI ptr
     ldr x0, [x0] // TCB ptr
 
-    // Save x1-x6 and sp
-    stp x1, x2, [x0, #{tcb_sa_off} + {sa_tmp_x1_x2}]
-    stp x3, x4, [x0, #{tcb_sa_off} + {sa_tmp_x3_x4}]
-    stp x5, x6, [x0, #{tcb_sa_off} + {sa_tmp_x5_x6}]
-    stp x7, x8, [x0, #{tcb_sa_off} + {sa_tmp_x7_x8}]
+    // Save x1-x8 and sp in the TCB: the code below uses them to pick a
+    // signal.
+",
+    each_reg!("str", "x0, #{tcb_sa_off} + {sa_tmp} + "; x1 x2 x3 x4 x5 x6 x7 x8),
+"
     mov x1, sp
-    str x1, [x0, #{tcb_sa_off} + {sa_tmp_sp}]
+    str x1, [x0, #{tcb_sa_off} + {sa_tmp} + {sp}]
 
     ldr x6, [x0, #{tcb_sa_off} + {sa_pctl}]
 1:
@@ -335,9 +370,9 @@ asmfunction!(__relibc_internal_sigentry: ["
     mov sp, x4
 
     // Save the floating point and SIMD registers above the integer
-    // registers: the Rust code below uses q0-q31 freely (memcpy, struct
-    // copies), and the interrupted code expects them unchanged. x86_64 does
-    // the same with fxsave64. x2 and x3 are free here.
+    // registers (ArchFpRegs): the Rust code below uses q0-q31 freely
+    // (memcpy, struct copies), and the interrupted code expects them
+    // unchanged. x86_64 does the same with fxsave64. x2 and x3 are free here.
     mrs x2, fpcr
     mrs x3, fpsr
     stp x2, x3, [sp, #-16]!
@@ -361,70 +396,37 @@ asmfunction!(__relibc_internal_sigentry: ["
     // skip sigaltstack step if SA_ONSTACK is clear
     // tbz x2, #{SA_ONSTACK_BIT}, 2f
 
+    // Below them the SigStack, which inner_c gets. Every register goes into
+    // the ArchIntRegs field of its own name (SigStack::regs).
+    sub sp, sp, #{ss_size}
+    str w1, [sp, #{ss_sig_num}]
+",
+    each_reg!("str", "sp, #{ss_regs} + "; $($reg)*),
+    copy_regs!("x0, #{tcb_sa_off} + {sa_tmp} + " => "sp, #{ss_regs} + "; x1 x2 x3 x4 x5 x6 x7 x8 sp),
+"
     ldr x2, [x0, #{tcb_sc_off} + {sc_saved_pc}]
-    ldr x3, [x0, #{tcb_sc_off} + {sc_saved_x0}]
-    stp x2, x3, [sp, #-16]!
-
-    ldr x2, [x0, #{tcb_sa_off} + {sa_tmp_sp}]
-    mrs x3, nzcv
-    stp x2, x3, [sp, #-16]!
-
-    // x2 goes below x1 (ArchIntRegs order, and `ldp x2, x1` below), like
-    // the other pairs.
-    ldp x2, x3, [x0, #{tcb_sa_off} + {sa_tmp_x1_x2}]
-    stp x3, x2, [sp, #-16]!
-    ldp x3, x4, [x0, #{tcb_sa_off} + {sa_tmp_x3_x4}]
-    stp x4, x3, [sp, #-16]!
-    ldp x5, x6, [x0, #{tcb_sa_off} + {sa_tmp_x5_x6}]
-    stp x6, x5, [sp, #-16]!
-    ldp x7, x8, [x0, #{tcb_sa_off} + {sa_tmp_x7_x8}]
-    stp x8, x7, [sp, #-16]!
-
-    stp x10, x9, [sp, #-16]!
-    stp x12, x11, [sp, #-16]!
-    stp x14, x13, [sp, #-16]!
-    stp x16, x15, [sp, #-16]!
-    stp x18, x17, [sp, #-16]!
-    stp x20, x19, [sp, #-16]!
-    stp x22, x21, [sp, #-16]!
-    stp x24, x23, [sp, #-16]!
-    stp x26, x25, [sp, #-16]!
-    stp x28, x27, [sp, #-16]!
-    stp x30, x29, [sp, #-16]!
-
-    str w1, [sp, #-4]
-    sub sp, sp, #64
+    str x2, [sp, #{ss_regs} + {pc}]
+    ldr x2, [x0, #{tcb_sc_off} + {sc_saved_x0}]
+    str x2, [sp, #{ss_regs} + {x0}]
+    mrs x2, nzcv
+    str x2, [sp, #{ss_regs} + {nzcv}]
 
     mov x0, sp
     bl {inner}
 
-    add sp, sp, #64
-
-    ldp x30, x29, [sp], #16
-    ldp x28, x27, [sp], #16
-    ldp x26, x25, [sp], #16
-    ldp x24, x23, [sp], #16
-    ldp x22, x21, [sp], #16
-    ldp x20, x19, [sp], #16
-    ldp x18, x17, [sp], #16
-    ldp x16, x15, [sp], #16
-    ldp x14, x13, [sp], #16
-    ldp x12, x11, [sp], #16
-    ldp x10, x9, [sp], #16
-    ldp x8, x7, [sp], #16
-    ldp x6, x5, [sp], #16
-    ldp x4, x3, [sp], #16
-    ldp x2, x1, [sp], #16
-
-    ldr x0, [sp, #8]
+    // Restore from the same fields. x18 is reserved by the ABI as 'platform
+    // register', so clobbering it should be safe: it holds the address of
+    // the ArchIntRegs until the jump back.
+    add x18, sp, #{ss_regs}
+",
+    each_reg!("ldr", "x18, #"; $($reg)*),
+    each_reg!("ldr", "x18, #"; x1 x2 x3 x4 x5 x6 x7 x8),
+"
+    ldr x0, [x18, #{nzcv}]
     msr nzcv, x0
 
-8:
-    // x18 is reserved by ABI as 'platform register', so clobbering it should be safe.
-    mov x18, sp
-
-    // Restore the floating point and SIMD registers saved above sp, pc and x0.
-    add x0, x18, #32
+    // The floating point and SIMD registers, right above the SigStack.
+    add x0, x18, #{int_regs_size}
     ldp q0, q1, [x0], #32
     ldp q2, q3, [x0], #32
     ldp q4, q5, [x0], #32
@@ -441,14 +443,15 @@ asmfunction!(__relibc_internal_sigentry: ["
     ldp q26, q27, [x0], #32
     ldp q28, q29, [x0], #32
     ldp q30, q31, [x0], #32
-    ldr x0, [x18, #544]
+    ldr x0, [x18, #{int_regs_size} + {fp_fpcr}]
     msr fpcr, x0
-    ldr x0, [x18, #552]
+    ldr x0, [x18, #{int_regs_size} + {fp_fpsr}]
     msr fpsr, x0
-    ldr x0, [x18]
-    mov sp, x0
 
-    ldp x18, x0, [x18, #16]
+    ldr x0, [x18, #{sp}]
+    mov sp, x0
+    ldr x0, [x18, #{x0}]
+    ldr x18, [x18, #{pc}]
     br x18
 7:
     // Spurious signal, i.e. all bitsets were 0 at the time they were checked
@@ -457,10 +460,9 @@ asmfunction!(__relibc_internal_sigentry: ["
     ldr x1, [x0, #{tcb_sc_off} + {sc_flags}]
     and x1, x1, ~1
     str x1, [x0, #{tcb_sc_off} + {sc_flags}]
-
-    ldp x1, x2, [x0, #{tcb_sa_off} + {sa_tmp_x1_x2}]
-    ldp x3, x4, [x0, #{tcb_sa_off} + {sa_tmp_x3_x4}]
-    ldp x5, x6, [x0, #{tcb_sa_off} + {sa_tmp_x5_x6}]
+",
+    each_reg!("ldr", "x0, #{tcb_sa_off} + {sa_tmp} + "; x1 x2 x3 x4 x5 x6 x7 x8),
+"
     ldr x18, [x0, #{tcb_sc_off} + {sc_saved_pc}]
     ldr x0, [x0, #{tcb_sc_off} + {sc_saved_x0}]
     br x18
@@ -470,11 +472,7 @@ asmfunction!(__relibc_internal_sigentry: ["
     pctl_sender_infos = const (offset_of!(SigProcControl, sender_infos)),
     tcb_sc_off = const (offset_of!(crate::Tcb, os_specific) + offset_of!(RtSigarea, control)),
     tcb_sa_off = const (offset_of!(crate::Tcb, os_specific) + offset_of!(RtSigarea, arch)),
-    sa_tmp_x1_x2 = const offset_of!(SigArea, tmp_x1_x2),
-    sa_tmp_x3_x4 = const offset_of!(SigArea, tmp_x3_x4),
-    sa_tmp_x5_x6 = const offset_of!(SigArea, tmp_x5_x6),
-    sa_tmp_x7_x8 = const offset_of!(SigArea, tmp_x7_x8),
-    sa_tmp_sp = const offset_of!(SigArea, tmp_sp),
+    sa_tmp = const offset_of!(SigArea, tmp),
     sa_tmp_rt_inf = const offset_of!(SigArea, tmp_rt_inf),
     sa_tmp_id_inf = const offset_of!(SigArea, tmp_id_inf),
     sa_pctl = const offset_of!(SigArea, pctl),
@@ -483,6 +481,24 @@ asmfunction!(__relibc_internal_sigentry: ["
     sc_sender_infos = const offset_of!(Sigcontrol, sender_infos),
     sc_word = const offset_of!(Sigcontrol, word),
     sc_flags = const offset_of!(Sigcontrol, control_flags),
+    ss_size = const size_of::<SigStack>(),
+    ss_regs = const offset_of!(SigStack, regs),
+    ss_sig_num = const offset_of!(SigStack, sig_num),
+    int_regs_size = const size_of::<ArchIntRegs>(),
+    fp_fpcr = const offset_of!(ArchFpRegs, fpcr),
+    fp_fpsr = const offset_of!(ArchFpRegs, fpsr),
+    x0 = const offset_of!(ArchIntRegs, x0),
+    x1 = const offset_of!(ArchIntRegs, x1),
+    x2 = const offset_of!(ArchIntRegs, x2),
+    x3 = const offset_of!(ArchIntRegs, x3),
+    x4 = const offset_of!(ArchIntRegs, x4),
+    x5 = const offset_of!(ArchIntRegs, x5),
+    x6 = const offset_of!(ArchIntRegs, x6),
+    x7 = const offset_of!(ArchIntRegs, x7),
+    x8 = const offset_of!(ArchIntRegs, x8),
+    sp = const offset_of!(ArchIntRegs, sp),
+    nzcv = const offset_of!(ArchIntRegs, nzcv),
+    pc = const offset_of!(ArchIntRegs, pc),
     proc_fd = sym PROC_FD,
     inner = sym inner_c,
     proc_call = sym PROC_CALL,
@@ -494,7 +510,16 @@ asmfunction!(__relibc_internal_sigentry: ["
     STACK_ALIGN = const 16,
     REDZONE_SIZE = const 128,
     RTINF_SIZE = const size_of::<RtSigInfo>(),
+    $($reg = const offset_of!(ArchIntRegs, $reg)),*
 ]);
+    };
+}
+
+// x18 is left out: the restore needs it as the base register.
+sigentry!(x9 x10 x11 x12 x13 x14 x15 x16 x17 x19 x20 x21 x22 x23 x24 x25 x26 x27 x28 x29 x30);
+
+// The pushes in the signal entry give exactly this layout.
+const _: () = assert!(size_of::<ArchFpRegs>() == 32 * 16 + 16);
 
 asmfunction!(__relibc_internal_rlct_clone_ret: ["
     # Load registers
