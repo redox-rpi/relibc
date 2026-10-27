@@ -148,6 +148,7 @@ $(BUILD)/$(PROFILE)/libc.so: $(BUILD)/$(PROFILE)/ld_so.o $(BUILD)/$(PROFILE)/lib
 		-Wl,--sort-common \
 		-Wl,--whole-archive $^ -Wl,--no-whole-archive \
 		-Wl,-soname,libc.so.6 \
+		-Wl,--build-id=sha1 \
 		$(LINKFLAGS) \
 		-o $@
 
