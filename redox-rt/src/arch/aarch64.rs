@@ -276,49 +276,49 @@ asmfunction!(__relibc_internal_sigentry: ["
     b 2f
 5:
     // A realtime signal was sent to this thread, try clearing its bit.
-    // x3 contains last rt signal word, x2 contains rt_idx
+    // x2 contains rt_idx, x1 the thread's realtime word (pending bits low,
+    // allowed bits high).
     clrex
 
     // Calculate the absolute sig_idx
-    add x1, x3, 32
+    add x1, x2, #32
 
-    // Load si_pid and si_uid
-    add x2, x0, #{tcb_sc_off} + {sc_sender_infos}
-    add x2, x2, w1, uxtb #3
-    ldar x2, [x2]
-
-    add x3, x0, #{tcb_sc_off} + {sc_word} + 8
-    ldxr x2, [x3]
-
-    // Calculate new mask
+    // Calculate the bit to clear
     mov x4, #1
     lsl x4, x4, x2
-    sub x2, x2, x4 // remove bit
 
+    add x3, x0, #{tcb_sc_off} + {sc_word} + 8
+    ldaxr x2, [x3]
+    bic x2, x2, x4 // remove bit, keep the allowed bits
     stxr w5, x2, [x3]
     cbnz w5, 1b
-    str x2, [x0, #{tcb_sa_off} + {sa_tmp_id_inf}]
+
+    // sender_infos only has entries for the standard signals.
+    str xzr, [x0, #{tcb_sa_off} + {sa_tmp_id_inf}]
     b 2f
 3:
     // A standard signal was sent to this thread, try clearing its bit.
-    clz w1, w1
-    mov x2, #31
-    sub x1, x2, x1
+    // x1 contains the thread's signal word (pending bits low, allowed bits
+    // high), x4 its pending allowed bits and x5 its address. Pick the
+    // highest of them, like the process signals above.
+    clz w3, w4
+    mov w2, #31
+    sub w3, w2, w3
+    // x3 now contains the sig_idx
+
+    // Clear its pending bit; the rest of the word, the allowed bits too,
+    // stays as it is.
+    mov x2, #1
+    lsl x2, x2, x3
+    sub x4, x1, x2 // bit was certainly set, so sub is allowed
+    stxr w2, x4, [x5]
+    cbnz w2, 1b
+    mov x1, x3
 
     // Load si_pid and si_uid
     add x2, x0, #{tcb_sc_off} + {sc_sender_infos}
     add x2, x2, w1, uxtb #3
     ldar x2, [x2]
-
-    // Clear bit from mask
-    mov x3, #1
-    lsl x3, x3, x1
-    sub x4, x4, x3
-
-    // Try updating the mask
-    stxr w3, x1, [x5]
-    cbnz w3, 1b
-
     str x2, [x0, #{tcb_sa_off} + {sa_tmp_id_inf}]
 2:
     ldr x3, [x0, #{tcb_sa_off} + {sa_pctl}]
