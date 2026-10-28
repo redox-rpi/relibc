@@ -141,6 +141,47 @@ extern "C" fn init_array() {
     }
 }
 
+/// Diagnostics (redox-rpi, T12): the filetable fd is missing from the auxv.
+/// Stop with `brk #0x7a` and leave the stack layout in the registers, which
+/// the kernel prints: x0 = sp, x1 = argc, x2 = number of env entries,
+/// x3 = auxv start as `Stack::auxv` computes it, x4..x17 and x20..x28 =
+/// the 23 words from auxv start - 3 words on. Normally the first auxv pair
+/// is (45 = AT_REDOX_FILETABLE_FD, fd) and the word before it is the NULL
+/// that ends envp.
+#[cfg(all(target_os = "redox", target_arch = "aarch64"))]
+#[cold]
+#[inline(never)]
+unsafe fn auxv_dump(sp: *const usize) -> ! {
+    unsafe {
+        let argc = *sp;
+        let mut p = sp.add(1 + argc + 1);
+        let mut envc = 0usize;
+        while *p != 0 {
+            p = p.add(1);
+            envc += 1;
+        }
+        let auxv = p.add(1);
+        let w = auxv.sub(3);
+        core::arch::asm!(
+            "brk #0x7a",
+            in("x0") sp, in("x1") argc, in("x2") envc, in("x3") auxv,
+            in("x4") *w.add(0), in("x5") *w.add(1), in("x6") *w.add(2),
+            in("x7") *w.add(3), in("x8") *w.add(4), in("x9") *w.add(5),
+            in("x10") *w.add(6), in("x11") *w.add(7), in("x12") *w.add(8),
+            in("x13") *w.add(9), in("x14") *w.add(10), in("x15") *w.add(11),
+            in("x16") *w.add(12), in("x17") *w.add(13),
+            in("x20") *w.add(14), in("x21") *w.add(15), in("x22") *w.add(16),
+            in("x23") *w.add(17), in("x24") *w.add(18), in("x25") *w.add(19),
+            in("x26") *w.add(20), in("x27") *w.add(21), in("x28") *w.add(22),
+            options(noreturn, nostack),
+        );
+    }
+}
+#[cfg(all(target_os = "redox", not(target_arch = "aarch64")))]
+unsafe fn auxv_dump(_sp: *const usize) -> ! {
+    panic!("no filetable fd present");
+}
+
 #[inline(never)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn relibc_start_v1(
@@ -180,7 +221,7 @@ pub unsafe extern "C" fn relibc_start_v1(
                     redox_rt::auxv_defs::AT_REDOX_FILETABLE_FD,
                 )
             }
-            .expect("no filetable fd present");
+            .unwrap_or_else(|| unsafe { auxv_dump((sp as *const Stack).cast()) });
             let filetable_guard = redox_rt::proc::FdGuard::new(filetable_fd)
                 .to_upper()
                 .expect("failed to move filetable fd to upper table");
