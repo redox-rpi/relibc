@@ -24,6 +24,13 @@ endif
 TARGET_HEADERS?=$(BUILD)/include
 export CFLAGS=-I$(TARGET_HEADERS)
 
+# The aarch64 signal entry returns with `br x18`, so compiled code must
+# never keep a value in x18 (redox-rpi #1).
+ifeq ($(TARGET),aarch64-unknown-redox)
+export RUSTFLAGS+=-Zfixed-x18
+CFLAGS+=-ffixed-x18
+endif
+
 PROFILE?=release
 
 HEADERS_UNPARSED=$(shell find src/header -mindepth 1 -maxdepth 1 -type d -not -name "_*" $(EXCEPT_MATH) -printf "%f\n")
