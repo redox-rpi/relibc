@@ -30,7 +30,7 @@ use crate::{
     header::{
         errno::{
             EBADF, EBADFD, EEXIST, EFAULT, EFBIG, EINTR, EINVAL, EIO, EMFILE, ENAMETOOLONG, ENOENT,
-            ENOEXEC, ENOMEM, ENOSYS, EOPNOTSUPP,
+            ENOEXEC, ENOMEM, ENOSYS, EOPNOTSUPP, EPERM,
         },
         fcntl::{
             self, AT_EACCESS, AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, F_GETLK,
@@ -1188,10 +1188,17 @@ impl Pal for Sys {
         Ok(())
     }
 
-    unsafe fn setgroups(size: size_t, list: *const gid_t) -> Result<()> {
-        // TODO
-        todo_skip!(0, "setgroups({}, {:p}): not implemented", size, list);
-        Err(Errno(ENOSYS))
+    unsafe fn setgroups(size: size_t, _list: *const gid_t) -> Result<()> {
+        // The kernel has no supplementary groups (getgroups reads them from
+        // /etc/group), so there is nothing to set: a process that drops its
+        // groups loses none, one that sets groups gains none.
+        if Self::geteuid() != 0 {
+            return Err(Errno(EPERM));
+        }
+        if size > limits::NGROUPS_MAX {
+            return Err(Errno(EINVAL));
+        }
+        Ok(())
     }
 
     fn setpgid(pid: pid_t, pgid: pid_t) -> Result<()> {
