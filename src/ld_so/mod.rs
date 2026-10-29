@@ -101,18 +101,21 @@ fn static_init(
         let vsize = (p_memsz + voff).div_ceil(page_size) * page_size;
 
         if p_type == elf::PT_TLS {
-            let valign = if p_align > 0 {
-                p_memsz.div_ceil(p_align) * p_align
-            } else {
-                p_memsz
-            };
+            let offset = Master::static_offset(0, p_memsz, p_align.max(1));
 
             unsafe {
                 STATIC_TCB_MASTER.ptr = p_vaddr as *const u8;
                 STATIC_TCB_MASTER.image_size = p_filesz;
-                STATIC_TCB_MASTER.offset = valign;
+                STATIC_TCB_MASTER.offset = offset;
+                STATIC_TCB_MASTER.segment_size = p_memsz;
 
-                let tcb = Tcb::new(vsize).expect("failed to allocate TCB");
+                // On aarch64 the block may start after an alignment gap.
+                let size = if cfg!(target_arch = "aarch64") {
+                    vsize.max(offset + p_memsz)
+                } else {
+                    vsize
+                };
+                let tcb = Tcb::new(size).expect("failed to allocate TCB");
                 tcb.masters_ptr = ptr::addr_of_mut!(STATIC_TCB_MASTER);
                 tcb.masters_len = mem::size_of::<Master>();
                 tcb.copy_masters().expect("failed to copy TLS master data");

@@ -11,6 +11,8 @@ use object::{
 };
 
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[cfg(target_arch = "aarch64")]
+use super::tcb::TLS_TCB_SIZE;
 use super::tcb::Tcb;
 use super::{
     debug::{_r_debug, RTLDDebug},
@@ -424,7 +426,7 @@ impl DSO {
                     image_size: usize::try_from(ph.p_filesz(NativeEndian))
                         .expect("always within bounds"),
                     segment_size: memsz,
-                    offset: (tls_offset + memsz).next_multiple_of(align),
+                    offset: Master::static_offset(tls_offset, memsz, align),
                 }
             })
             .unwrap();
@@ -807,7 +809,7 @@ impl DSO {
                         image_size: usize::try_from(ph.p_filesz(endian))
                             .expect("always within bounds"),
                         segment_size: memsz,
-                        offset: (tls_offset + memsz).next_multiple_of(align),
+                        offset: Master::static_offset(tls_offset, memsz, align),
                     });
                     log::trace!("  tcb master {:x?}", tcb_master);
                 }
@@ -1199,6 +1201,9 @@ impl DSO {
             })) as usize;
         } else {
             *resolver = __tlsdesc_static as *const () as usize;
+            // The resolver returns an offset from the thread pointer.
+            #[cfg(target_arch = "aarch64")]
+            let tls_offset = tls_offset + TLS_TCB_SIZE;
             *descriptor = sym + tls_offset + reloc.addend.unwrap_or_default();
         }
     }
@@ -1290,7 +1295,10 @@ impl DSO {
                     0
                 };
 
-                set_usize(if reloc.kind == RelocationKind::TPOFF {
+                set_usize(if cfg!(target_arch = "aarch64") {
+                    // Variant I: offset from the thread pointer, above it.
+                    a + b + tls_obj.tls_offset + TLS_TCB_SIZE
+                } else if reloc.kind == RelocationKind::TPOFF {
                     (a + b).wrapping_sub(tls_obj.tls_offset)
                 } else {
                     tls_obj.tls_offset.wrapping_sub(a + b)

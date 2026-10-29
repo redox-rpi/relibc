@@ -30,7 +30,41 @@ pub struct Master {
     pub offset: usize,
 }
 
+/// Thread control block size above the thread pointer in the aarch64 TLS
+/// layout (variant I): the static TLS area starts 16 bytes after it.
+#[cfg(target_arch = "aarch64")]
+pub const TLS_TCB_SIZE: usize = 16;
+
 impl Master {
+    /// Offset in the static TLS area of a block of `memsz` bytes aligned to
+    /// `align`, placed after `start` bytes of earlier blocks.
+    ///
+    /// On aarch64 the linker puts the first block at `align_up(16, align)`
+    /// from the thread pointer and each further one at the next aligned
+    /// offset after the previous one; the area starts 16 bytes after the
+    /// thread pointer, so the offset is the block's start. On the other
+    /// architectures it is the block's end, counted backwards.
+    pub fn static_offset(start: usize, memsz: usize, align: usize) -> usize {
+        #[cfg(target_arch = "aarch64")]
+        {
+            let _ = memsz;
+            (TLS_TCB_SIZE + start).next_multiple_of(align) - TLS_TCB_SIZE
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            (start + memsz).next_multiple_of(align)
+        }
+    }
+
+    /// Bytes of the static TLS area used up to and including this block.
+    pub fn static_end(&self) -> usize {
+        if cfg!(target_arch = "aarch64") {
+            self.offset + self.segment_size
+        } else {
+            self.offset
+        }
+    }
+
     /// The initial data for this TLS region
     pub unsafe fn data(&self) -> &'static [u8] {
         unsafe { slice::from_raw_parts(self.ptr, self.image_size) }
@@ -152,19 +186,14 @@ impl Tcb {
         if let Some(tls) = unsafe { self.tls() }
             && let Some(masters) = self.masters()
         {
-            for (i, master) in masters.iter().skip(self.num_copied_masters).enumerate() {
+            for master in masters.iter().skip(self.num_copied_masters) {
                 if master.image_size == 0 {
                     continue;
                 }
 
-                let master_idx = self.num_copied_masters + i;
                 let range = if cfg!(any(target_arch = "x86", target_arch = "x86_64")) {
                     // x86{_64} TLS layout is backwards
                     self.tls_len - master.offset..self.tls_len - master.offset + master.image_size
-                } else if cfg!(target_arch = "aarch64") {
-                    // AArch64 p_vaddr is ignored for first master, this is experimentally determined
-                    let start = if master_idx == 0 { 0 } else { master.offset };
-                    start..start + master.image_size
                 } else {
                     master.offset..master.offset + master.image_size
                 };
@@ -233,9 +262,6 @@ impl Tcb {
                     let offset = if cfg!(any(target_arch = "x86", target_arch = "x86_64")) {
                         // x86{_64} TLS layout is backwards
                         self.tls_len - master.offset
-                    } else if cfg!(target_arch = "aarch64") {
-                        // AArch64 p_vaddr is ignored for first master
-                        if i == 0 { 0 } else { master.offset }
                     } else {
                         master.offset
                     };

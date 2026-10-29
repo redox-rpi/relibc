@@ -849,7 +849,7 @@ impl Linker {
                 );
             }
 
-            self.tls_size = master.offset;
+            self.tls_size = master.static_end();
             self.next_tls_module_id += 1;
             self.next_object_id += 1;
 
@@ -910,7 +910,7 @@ impl Linker {
 
         if let Some(master) = tcb_master {
             if !dlopened {
-                self.tls_size = master.offset; // => aligned ph.p_memsz
+                self.tls_size = master.static_end(); // => aligned ph.p_memsz
             }
 
             tcb_masters.push(master);
