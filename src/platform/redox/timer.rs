@@ -75,6 +75,12 @@ impl RlctTimer {
 }
 
 pub extern "C" fn timer_routine(arg: *mut c_void) -> *mut c_void {
+    // SIGEV_SIGNAL sends the signal to the process, so any thread that does
+    // not block it may take it, this one too. Then the thread that waits for
+    // it (sem_wait, pause, ...) is not interrupted: it sees at most what the
+    // handler did, on another thread. Block all signals here, as glibc does
+    // in its timer thread.
+    let _ = redox_rt::signal::set_sigmask(Some(!0), None);
     let (mut timer_version, eventfd) = {
         let timers = TIMERS.lock();
         let Some(timer_st) = timers.get(&arg.addr()) else {
