@@ -53,7 +53,7 @@ use super::{
     stdio::snprintf,
 };
 
-mod alarm;
+pub(crate) mod alarm;
 mod brk;
 mod getopt;
 mod getpass;

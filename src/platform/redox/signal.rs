@@ -13,7 +13,9 @@ use crate::{
             SIG_BLOCK, SIG_DFL, SIG_IGN, SIG_SETMASK, SIG_UNBLOCK, SS_DISABLE, SS_ONSTACK,
             sigaction, siginfo_t, sigval, stack_t, ucontext_t,
         },
-        time::timespec,
+        sys_select::timeval,
+        time::{itimerspec, timespec},
+        unistd::alarm::real_timer,
     },
 };
 use core::mem::offset_of;
@@ -46,22 +48,11 @@ const _: () = {
 
 impl PalSignal for Sys {
     #[allow(deprecated)]
-    #[expect(unused_variables, reason = "setitimer not implemented")]
     fn getitimer(which: c_int, out: &mut itimerval) -> Result<()> {
-        let path = match which {
-            ITIMER_REAL => "/scheme/itimer/1",
-            _ => return Err(Errno(EINVAL)),
-        };
-        // TODO: implement setitimer
-        // let fd = FdGuard::new(redox_rt::sys::open(path, syscall::O_RDONLY | syscall::O_CLOEXEC)?);
-        // let count = syscall::read(*fd, &mut spec)?;
-
-        let spec = syscall::ITimerSpec::default();
-        out.it_interval.tv_sec = spec.it_interval.tv_sec as time_t;
-        out.it_interval.tv_usec = spec.it_interval.tv_nsec / 1000;
-        out.it_value.tv_sec = spec.it_value.tv_sec as time_t;
-        out.it_value.tv_usec = spec.it_value.tv_nsec / 1000;
-
+        if which != ITIMER_REAL {
+            return Err(Errno(EINVAL));
+        }
+        *out = itimerval_from(&real_timer(None));
         Ok(())
     }
 
@@ -90,12 +81,22 @@ impl PalSignal for Sys {
     }
 
     #[allow(deprecated)]
-    fn setitimer(_which: c_int, _new: &itimerval, _old: Option<&mut itimerval>) -> Result<()> {
-        // TODO: setitimer is no longer part of POSIX and should not be implemented in Redox
-        // Change the platform-independent implementation to use POSIX timers.
-        // For Redox, the timer should probably use "/scheme/time"
-        todo_skip!(0, "setitimer not implemented");
-        Err(Errno(ENOSYS))
+    fn setitimer(which: c_int, new: &itimerval, old: Option<&mut itimerval>) -> Result<()> {
+        if which != ITIMER_REAL {
+            // ITIMER_VIRTUAL and ITIMER_PROF count CPU time, which Redox does
+            // not offer as a timer.
+            todo_skip!(0, "setitimer({which}) not implemented");
+            return Err(Errno(ENOSYS));
+        }
+        let spec = itimerspec {
+            it_interval: timespec_from(&new.it_interval)?,
+            it_value: timespec_from(&new.it_value)?,
+        };
+        let prev = real_timer(Some(&spec));
+        if let Some(old) = old {
+            *old = itimerval_from(&prev);
+        }
+        Ok(())
     }
 
     fn sigaction(
@@ -269,5 +270,27 @@ impl PalSignal for Sys {
             *out = info;
         }
         Ok(info.si_signo)
+    }
+}
+
+fn timespec_from(tv: &timeval) -> Result<timespec> {
+    if !(0..1_000_000).contains(&tv.tv_usec) {
+        return Err(Errno(EINVAL));
+    }
+    Ok(timespec {
+        tv_sec: tv.tv_sec,
+        tv_nsec: (tv.tv_usec * 1000) as _,
+    })
+}
+
+#[allow(deprecated)]
+fn itimerval_from(spec: &itimerspec) -> itimerval {
+    let tv = |ts: &timespec| timeval {
+        tv_sec: ts.tv_sec,
+        tv_usec: (ts.tv_nsec / 1000) as _,
+    };
+    itimerval {
+        it_interval: tv(&spec.it_interval),
+        it_value: tv(&spec.it_value),
     }
 }

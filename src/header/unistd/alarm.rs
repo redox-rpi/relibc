@@ -31,34 +31,40 @@ static ALARM_TIMER: Mutex<Option<AlarmTimer>> = Mutex::new(None);
 /// pending alarm be preserved across exec (the timer continues counting down
 /// in the new process image as i understand).
 pub fn alarm_timespec(duration: timespec) -> c_uint {
+    // Arm the timer as a one-shot (no interval)
+    let old = real_timer(Some(&itimerspec {
+        it_value: duration,
+        it_interval: timespec::default(),
+    }));
+    let secs = old.it_value.tv_sec as c_uint;
+    if old.it_value.tv_nsec > 0 {
+        secs + 1 // POSIX: round up
+    } else {
+        secs
+    }
+}
+
+/// Returns the setting of the process-global alarm timer and, if `new` is
+/// given, arms it with `new` (a zero `it_value` disarms it). `alarm()` and
+/// `setitimer(ITIMER_REAL)` share this timer, as on Linux.
+pub fn real_timer(new: Option<&itimerspec>) -> itimerspec {
     let mut guard = ALARM_TIMER.lock();
 
-    // Determine remaining time on any existing alarm
-    let remaining = if let Some(ref alarm) = *guard {
-        match Sys::timer_gettime(alarm.0) {
-            Ok(cur) => {
-                let secs = cur.it_value.tv_sec as c_uint;
-                if cur.it_value.tv_nsec > 0 {
-                    secs + 1 // POSIX: round up
-                } else {
-                    secs
-                }
-            }
-            Err(_) => 0,
-        }
-    } else {
-        0
+    let old = guard
+        .as_ref()
+        .and_then(|alarm| Sys::timer_gettime(alarm.0).ok())
+        .unwrap_or_default();
+
+    let Some(new) = new else {
+        return old;
     };
 
-    let disarm = duration.tv_sec == 0 && duration.tv_nsec == 0;
-
-    if disarm {
-        // alarm(0): cancel any pending alarm
+    if new.it_value.tv_sec == 0 && new.it_value.tv_nsec == 0 {
         if let Some(ref alarm) = *guard {
             let zero = itimerspec::default();
             let _ = Sys::timer_settime(alarm.0, 0, &zero, None);
         }
-        return remaining;
+        return old;
     }
 
     // Lazily create the singleton timer if it doesn't exist yet
@@ -69,20 +75,14 @@ pub fn alarm_timespec(duration: timespec) -> c_uint {
         evp.sigev_notify = SIGEV_SIGNAL;
         evp.sigev_signo = c_int::try_from(SIGALRM).expect("constant within c_int::MAX");
         let Ok(timer_id) = Sys::timer_create(crate::header::time::CLOCK_REALTIME, &evp) else {
-            return remaining;
+            return old;
         };
 
         *guard = Some(AlarmTimer(timer_id));
         timer_id
     };
-    drop(guard);
 
-    // Arm the timer as a one-shot (no interval)
-    let spec = itimerspec {
-        it_value: duration,
-        it_interval: timespec::default(),
-    };
-    let _ = Sys::timer_settime(timer_id, 0, &spec, None);
+    let _ = Sys::timer_settime(timer_id, 0, new, None);
 
-    remaining
+    old
 }
