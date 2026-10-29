@@ -225,6 +225,7 @@ asmfunction!(__relibc_internal_sigentry: ["
     // Try clearing the bit, retrying on failure.
     stxr w1, x4, [x5] // try setting pending set to x4, set w1 := 0 on success
     cbnz w1, 1b // retry everything if this fails
+    str x2, [x0, #{tcb_sa_off} + {sa_tmp_id_inf}]
     mov x1, x3
     b 2f
 4:
@@ -295,6 +296,7 @@ asmfunction!(__relibc_internal_sigentry: ["
 
     // sender_infos only has entries for the standard signals.
     str xzr, [x0, #{tcb_sa_off} + {sa_tmp_id_inf}]
+    add x1, x1, #64 // indicate signal was targeted at thread
     b 2f
 3:
     // A standard signal was sent to this thread, try clearing its bit.
@@ -313,17 +315,19 @@ asmfunction!(__relibc_internal_sigentry: ["
     sub x4, x1, x2 // bit was certainly set, so sub is allowed
     stxr w2, x4, [x5]
     cbnz w2, 1b
-    mov x1, x3
 
     // Load si_pid and si_uid
     add x2, x0, #{tcb_sc_off} + {sc_sender_infos}
-    add x2, x2, w1, uxtb #3
+    add x2, x2, w3, uxtb #3
     ldar x2, [x2]
     str x2, [x0, #{tcb_sa_off} + {sa_tmp_id_inf}]
+    add x1, x3, #64 // indicate signal was targeted at thread
 2:
+    // x1 is sig_idx, plus 64 if the signal was sent to this thread.
     ldr x3, [x0, #{tcb_sa_off} + {sa_pctl}]
     add x3, x3, {pctl_actions}
-    add x2, x3, w1, uxtb #4 // actions_base + sig_idx * sizeof Action
+    and w4, w1, #63
+    add x2, x3, w4, uxtb #4 // actions_base + sig_idx * sizeof Action
     // TODO: NOT ATOMIC (tearing allowed between regs)!
     ldxp x2, x3, [x2]
     clrex
