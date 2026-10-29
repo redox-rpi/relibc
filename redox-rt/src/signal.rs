@@ -270,6 +270,24 @@ unsafe fn inner(stack: &mut SigStack) {
 
     // TODO: Support restoring uc_stack?
 
+    #[cfg(target_arch = "aarch64")]
+    {
+        // The signal entry returns through `svc #0x5352` (redox-rpi #1): the
+        // kernel sets pc and x0 from these fields and, with
+        // SIGRETURN_UNINHIBIT set, re-enables delivery and delivers pending
+        // unblocked signals right away. Delivery stays inhibited until then.
+        os.control.saved_ip.set(stack.regs.pc);
+        os.control.saved_archdep_reg.set(stack.regs.x0);
+        let _ = pending_unblocked;
+        if !signals_were_disabled {
+            core::sync::atomic::compiler_fence(Ordering::Release);
+            control_flags.store(
+                control_flags.load(Ordering::Relaxed) | SIGRETURN_UNINHIBIT,
+                Ordering::Relaxed,
+            );
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     if pending_unblocked > 0 {
         // If there were signals visible at the time we checked (otherwise it can be considered
         // "asynchronous" and will be delivered the next time an EINTR is seen, or after the
@@ -290,6 +308,11 @@ unsafe fn inner(stack: &mut SigStack) {
     }
 }
 #[cfg(not(target_arch = "x86"))]
+/// Control flag for the aarch64 signal return (redox-rpi #1): the kernel
+/// clears it and INHIBIT_DELIVERY in `svc #0x5352`. Not in the syscall crate.
+#[cfg(target_arch = "aarch64")]
+const SIGRETURN_UNINHIBIT: usize = 4;
+
 pub(crate) unsafe extern "C" fn inner_c(stack: usize) {
     unsafe { inner(&mut *(stack as *mut SigStack)) }
 }

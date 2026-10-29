@@ -400,70 +400,72 @@ asmfunction!(__relibc_internal_sigentry: ["
 
     add sp, sp, #64
 
-    ldp x30, x29, [sp], #16
-    ldp x28, x27, [sp], #16
-    ldp x26, x25, [sp], #16
-    ldp x24, x23, [sp], #16
-    ldp x22, x21, [sp], #16
-    ldp x20, x19, [sp], #16
-    ldp x18, x17, [sp], #16
-    ldp x16, x15, [sp], #16
-    ldp x14, x13, [sp], #16
-    ldp x12, x11, [sp], #16
-    ldp x10, x9, [sp], #16
-    ldp x8, x7, [sp], #16
-    ldp x6, x5, [sp], #16
-    ldp x4, x3, [sp], #16
-    ldp x2, x1, [sp], #16
+    // Return without clobbering a register (redox-rpi #1): restore every
+    // register from the frame, then `svc #0x5352`, which makes the kernel set
+    // pc and x0 from the sigcontrol struct (inner wrote them there) and
+    // re-enable signal delivery. Until then delivery stays inhibited. x0 is
+    // the base register here, as the kernel restores it.
+    mov x0, sp
+    add x1, x0, #240 // sp, nzcv, pc, x0, then q0-q31, fpcr and fpsr
 
-    ldr x0, [sp, #8]
-    msr nzcv, x0
-
-8:
-    // x18 is reserved by ABI as 'platform register', so clobbering it should be safe.
-    mov x18, sp
+    ldr x2, [x1, #8]
+    msr nzcv, x2
 
     // Restore the floating point and SIMD registers saved above sp, pc and x0.
-    add x0, x18, #32
-    ldp q0, q1, [x0], #32
-    ldp q2, q3, [x0], #32
-    ldp q4, q5, [x0], #32
-    ldp q6, q7, [x0], #32
-    ldp q8, q9, [x0], #32
-    ldp q10, q11, [x0], #32
-    ldp q12, q13, [x0], #32
-    ldp q14, q15, [x0], #32
-    ldp q16, q17, [x0], #32
-    ldp q18, q19, [x0], #32
-    ldp q20, q21, [x0], #32
-    ldp q22, q23, [x0], #32
-    ldp q24, q25, [x0], #32
-    ldp q26, q27, [x0], #32
-    ldp q28, q29, [x0], #32
-    ldp q30, q31, [x0], #32
-    ldr x0, [x18, #544]
-    msr fpcr, x0
-    ldr x0, [x18, #552]
-    msr fpsr, x0
-    ldr x0, [x18]
-    mov sp, x0
+    add x2, x1, #32
+    ldp q0, q1, [x2], #32
+    ldp q2, q3, [x2], #32
+    ldp q4, q5, [x2], #32
+    ldp q6, q7, [x2], #32
+    ldp q8, q9, [x2], #32
+    ldp q10, q11, [x2], #32
+    ldp q12, q13, [x2], #32
+    ldp q14, q15, [x2], #32
+    ldp q16, q17, [x2], #32
+    ldp q18, q19, [x2], #32
+    ldp q20, q21, [x2], #32
+    ldp q22, q23, [x2], #32
+    ldp q24, q25, [x2], #32
+    ldp q26, q27, [x2], #32
+    ldp q28, q29, [x2], #32
+    ldp q30, q31, [x2], #32
+    ldr x2, [x1, #544]
+    msr fpcr, x2
+    ldr x2, [x1, #552]
+    msr fpsr, x2
+    ldr x2, [x1]
+    mov sp, x2
 
-    ldp x18, x0, [x18, #16]
-    br x18
+    ldp x30, x29, [x0], #16
+    ldp x28, x27, [x0], #16
+    ldp x26, x25, [x0], #16
+    ldp x24, x23, [x0], #16
+    ldp x22, x21, [x0], #16
+    ldp x20, x19, [x0], #16
+    ldp x18, x17, [x0], #16
+    ldp x16, x15, [x0], #16
+    ldp x14, x13, [x0], #16
+    ldp x12, x11, [x0], #16
+    ldp x10, x9, [x0], #16
+    ldp x8, x7, [x0], #16
+    ldp x6, x5, [x0], #16
+    ldp x4, x3, [x0], #16
+    ldp x2, x1, [x0], #16
+    svc #0x5352
 7:
     // Spurious signal, i.e. all bitsets were 0 at the time they were checked
     clrex
 
+    // Keep delivery inhibited; the kernel re-enables it in `svc #0x5352`,
+    // which also restores pc and x0 from the sigcontrol struct.
     ldr x1, [x0, #{tcb_sc_off} + {sc_flags}]
-    and x1, x1, ~1
+    orr x1, x1, #4 // SIGRETURN_UNINHIBIT
     str x1, [x0, #{tcb_sc_off} + {sc_flags}]
 
     ldp x1, x2, [x0, #{tcb_sa_off} + {sa_tmp_x1_x2}]
     ldp x3, x4, [x0, #{tcb_sa_off} + {sa_tmp_x3_x4}]
     ldp x5, x6, [x0, #{tcb_sa_off} + {sa_tmp_x5_x6}]
-    ldr x18, [x0, #{tcb_sc_off} + {sc_saved_pc}]
-    ldr x0, [x0, #{tcb_sc_off} + {sc_saved_x0}]
-    br x18
+    svc #0x5352
 "] <= [
     pctl_pending = const (offset_of!(SigProcControl, pending)),
     pctl_actions = const (offset_of!(SigProcControl, actions)),
