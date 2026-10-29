@@ -495,7 +495,15 @@ fn stage2(
         crate::platform::init_inner(auxv);
     }
 
-    let Some((path, _name)) = resolve_path_name(&name_or_path, &envs) else {
+    // A login shell gets "-" in front of its name in argv[0] ("-ion" from
+    // login or sshd); ld.so finds the program through argv[0], so try the name
+    // without it. TODO: pass the executable's path (AT_EXECFN) instead.
+    let resolved = resolve_path_name(&name_or_path, &envs).or_else(|| {
+        name_or_path
+            .strip_prefix('-')
+            .and_then(|name| resolve_path_name(name, &envs))
+    });
+    let Some((path, _name)) = resolved else {
         eprintln!("[ld.so]: failed to locate '{name_or_path}'");
         unistd::_exit(1);
     };
