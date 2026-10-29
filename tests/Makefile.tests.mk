@@ -232,6 +232,7 @@ EXPECT_NAMES=\
 # Binaries that may generate varied output
 VARIED_NAMES=\
 	dirent/main \
+	tls_probe \
 	dirent/posix_getdents \
 	includes \
 	kill-waitpid \
