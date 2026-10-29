@@ -1,11 +1,11 @@
-use core::{cell::SyncUnsafeCell, mem::offset_of, ptr::NonNull};
+use core::{cell::SyncUnsafeCell, mem::offset_of, ptr::NonNull, sync::atomic::AtomicU64};
 
 use syscall::{data::*, error::*};
 
 use crate::{
     Tcb,
     proc::{FdGuard, FdGuardUpper, ForkArgs, fork_inner},
-    signal::{PosixStackt, RtSigarea, SigStack, inner_c},
+    signal::{PosixStackt, RtSigarea, SigStack, get_sigaltstack, inner_c, inner_excp_c},
 };
 use redox_protocols::protocol::{ProcCall, RtSigInfo};
 
@@ -328,8 +328,21 @@ asmfunction!(__relibc_internal_sigentry: ["
     ldxp x2, x3, [x2]
     clrex
 
-    // Calculate new sp wrt redzone and alignment
+    // Calculate new sp wrt sigaltstack, redzone and alignment. With
+    // SA_ONSTACK (bit 58 of the action's first word, x2), switch to the top
+    // of the sigaltstack unless sp is on it already. A disabled sigaltstack
+    // has top = usize::MAX and bottom = 0, so sp stays.
     mov x4, sp
+    tbz x2, #{SA_ONSTACK_BIT}, 6f
+    ldr x5, [x0, #{tcb_sa_off} + {sa_altstack_top}]
+    ldr x6, [x0, #{tcb_sa_off} + {sa_altstack_bottom}]
+    cmp x4, x5
+    b.hi 9f
+    cmp x4, x6
+    b.hi 6f
+9:
+    mov x4, x5
+6:
     sub x4, x4, {REDZONE_SIZE}
     and x4, x4, -{STACK_ALIGN}
     mov sp, x4
@@ -357,9 +370,6 @@ asmfunction!(__relibc_internal_sigentry: ["
     stp q4, q5, [sp, #-32]!
     stp q2, q3, [sp, #-32]!
     stp q0, q1, [sp, #-32]!
-
-    // skip sigaltstack step if SA_ONSTACK is clear
-    // tbz x2, #{SA_ONSTACK_BIT}, 2f
 
     ldr x2, [x0, #{tcb_sc_off} + {sc_saved_pc}]
     ldr x3, [x0, #{tcb_sc_off} + {sc_saved_x0}]
@@ -400,6 +410,10 @@ asmfunction!(__relibc_internal_sigentry: ["
 
     add sp, sp, #64
 
+    // Also the way back for __relibc_internal_excpentry.
+    .globl __relibc_internal_sigentry_restore
+    .hidden __relibc_internal_sigentry_restore
+__relibc_internal_sigentry_restore:
     ldp x30, x29, [sp], #16
     ldp x28, x27, [sp], #16
     ldp x26, x25, [sp], #16
@@ -475,6 +489,8 @@ asmfunction!(__relibc_internal_sigentry: ["
     sa_tmp_x5_x6 = const offset_of!(SigArea, tmp_x5_x6),
     sa_tmp_x7_x8 = const offset_of!(SigArea, tmp_x7_x8),
     sa_tmp_sp = const offset_of!(SigArea, tmp_sp),
+    sa_altstack_top = const offset_of!(SigArea, altstack_top),
+    sa_altstack_bottom = const offset_of!(SigArea, altstack_bottom),
     sa_tmp_rt_inf = const offset_of!(SigArea, tmp_rt_inf),
     sa_tmp_id_inf = const offset_of!(SigArea, tmp_id_inf),
     sa_pctl = const offset_of!(SigArea, pctl),
@@ -495,6 +511,129 @@ asmfunction!(__relibc_internal_sigentry: ["
     REDZONE_SIZE = const 128,
     RTINF_SIZE = const size_of::<RtSigInfo>(),
 ]);
+
+// Entered by the kernel on a synchronous exception in user mode (data or
+// instruction abort, undefined instruction, brk, ...), like
+// __relibc_internal_sigentry with the old pc and x0 in the sigcontrol struct,
+// and the exception class (ESR_EL1.EC) and fault address in saved_excp_code
+// and saved_excp_addr. Builds the same frame, lets inner_excp pick and run
+// the signal for the exception, and returns through the restore part of
+// __relibc_internal_sigentry.
+asmfunction!(__relibc_internal_excpentry: ["
+    clrex
+
+    mrs x0, tpidr_el0 // ABI ptr
+    ldr x0, [x0] // TCB ptr
+
+    stp x1, x2, [x0, #{tcb_sa_off} + {sa_tmp_x1_x2}]
+    stp x3, x4, [x0, #{tcb_sa_off} + {sa_tmp_x3_x4}]
+    stp x5, x6, [x0, #{tcb_sa_off} + {sa_tmp_x5_x6}]
+    stp x7, x8, [x0, #{tcb_sa_off} + {sa_tmp_x7_x8}]
+    mov x4, sp
+    str x4, [x0, #{tcb_sa_off} + {sa_tmp_sp}]
+
+    // Switch to the sigaltstack if the signal for this exception class has
+    // SA_ONSTACK (one bit per class in GLOBAL_EXCP_STACK_BITSET) and sp is
+    // not on it yet.
+    adrp x2, {bitset}
+    ldr x2, [x2, #:lo12:{bitset}]
+    ldr x3, [x0, #{tcb_sc_off} + {sc_saved_excp_code}]
+    and x3, x3, #63
+    lsr x2, x2, x3
+    tbz x2, #0, 2f
+    ldr x5, [x0, #{tcb_sa_off} + {sa_altstack_top}]
+    ldr x6, [x0, #{tcb_sa_off} + {sa_altstack_bottom}]
+    cmp x4, x5
+    b.hi 1f
+    cmp x4, x6
+    b.hi 2f
+1:
+    mov x4, x5
+2:
+    sub x4, x4, {REDZONE_SIZE}
+    and x4, x4, -{STACK_ALIGN}
+    mov sp, x4
+
+    // Save the floating point and SIMD registers above the integer
+    // registers, as in __relibc_internal_sigentry.
+    mrs x2, fpcr
+    mrs x3, fpsr
+    stp x2, x3, [sp, #-16]!
+    stp q30, q31, [sp, #-32]!
+    stp q28, q29, [sp, #-32]!
+    stp q26, q27, [sp, #-32]!
+    stp q24, q25, [sp, #-32]!
+    stp q22, q23, [sp, #-32]!
+    stp q20, q21, [sp, #-32]!
+    stp q18, q19, [sp, #-32]!
+    stp q16, q17, [sp, #-32]!
+    stp q14, q15, [sp, #-32]!
+    stp q12, q13, [sp, #-32]!
+    stp q10, q11, [sp, #-32]!
+    stp q8, q9, [sp, #-32]!
+    stp q6, q7, [sp, #-32]!
+    stp q4, q5, [sp, #-32]!
+    stp q2, q3, [sp, #-32]!
+    stp q0, q1, [sp, #-32]!
+
+    ldr x2, [x0, #{tcb_sc_off} + {sc_saved_pc}]
+    ldr x3, [x0, #{tcb_sc_off} + {sc_saved_x0}]
+    stp x2, x3, [sp, #-16]!
+
+    ldr x2, [x0, #{tcb_sa_off} + {sa_tmp_sp}]
+    mrs x3, nzcv
+    stp x2, x3, [sp, #-16]!
+
+    ldp x2, x3, [x0, #{tcb_sa_off} + {sa_tmp_x1_x2}]
+    stp x3, x2, [sp, #-16]!
+    ldp x3, x4, [x0, #{tcb_sa_off} + {sa_tmp_x3_x4}]
+    stp x4, x3, [sp, #-16]!
+    ldp x5, x6, [x0, #{tcb_sa_off} + {sa_tmp_x5_x6}]
+    stp x6, x5, [sp, #-16]!
+    ldp x7, x8, [x0, #{tcb_sa_off} + {sa_tmp_x7_x8}]
+    stp x8, x7, [sp, #-16]!
+
+    stp x10, x9, [sp, #-16]!
+    stp x12, x11, [sp, #-16]!
+    stp x14, x13, [sp, #-16]!
+    stp x16, x15, [sp, #-16]!
+    stp x18, x17, [sp, #-16]!
+    stp x20, x19, [sp, #-16]!
+    stp x22, x21, [sp, #-16]!
+    stp x24, x23, [sp, #-16]!
+    stp x26, x25, [sp, #-16]!
+    stp x28, x27, [sp, #-16]!
+    stp x30, x29, [sp, #-16]!
+
+    sub sp, sp, #64
+
+    mov x0, sp
+    bl {inner_excp}
+
+    add sp, sp, #64
+    b __relibc_internal_sigentry_restore
+"] <= [
+    tcb_sc_off = const (offset_of!(crate::Tcb, os_specific) + offset_of!(RtSigarea, control)),
+    tcb_sa_off = const (offset_of!(crate::Tcb, os_specific) + offset_of!(RtSigarea, arch)),
+    sa_tmp_x1_x2 = const offset_of!(SigArea, tmp_x1_x2),
+    sa_tmp_x3_x4 = const offset_of!(SigArea, tmp_x3_x4),
+    sa_tmp_x5_x6 = const offset_of!(SigArea, tmp_x5_x6),
+    sa_tmp_x7_x8 = const offset_of!(SigArea, tmp_x7_x8),
+    sa_tmp_sp = const offset_of!(SigArea, tmp_sp),
+    sa_altstack_top = const offset_of!(SigArea, altstack_top),
+    sa_altstack_bottom = const offset_of!(SigArea, altstack_bottom),
+    sc_saved_pc = const offset_of!(Sigcontrol, saved_ip),
+    sc_saved_x0 = const offset_of!(Sigcontrol, saved_archdep_reg),
+    sc_saved_excp_code = const offset_of!(Sigcontrol, saved_excp_code),
+    bitset = sym GLOBAL_EXCP_STACK_BITSET,
+    inner_excp = sym inner_excp_c,
+
+    STACK_ALIGN = const 16,
+    REDZONE_SIZE = const 128,
+]);
+
+/// One bit per exception class (ESR_EL1.EC) whose signal has SA_ONSTACK.
+pub(crate) static GLOBAL_EXCP_STACK_BITSET: AtomicU64 = AtomicU64::new(0);
 
 asmfunction!(__relibc_internal_rlct_clone_ret: ["
     # Load registers
@@ -535,18 +674,27 @@ pub unsafe fn manually_enter_trampoline() {
     }
 }
 
-#[expect(unused_variables, reason = "function not yet fully implemented")]
+/// Calculates the value for uc_stack. The signal entry cannot be
+/// interrupted halfway through its return (it ends with one `br`), so there
+/// is nothing to fix up, unlike x86_64.
 pub unsafe fn arch_pre(stack: &mut SigStack, os: &mut SigArea) -> PosixStackt {
-    PosixStackt {
-        sp: core::ptr::null_mut(), // TODO
-        size: 0,                   // TODO
-        flags: 0,                  // TODO
-    }
+    get_sigaltstack(os, stack.regs.sp).into()
 }
-/// map to `si_signo` and `si_code`.
-pub(crate) fn map_err_code(_excp: &syscall::Exception) -> (i32, i32) {
+/// map to `si_signo` and `si_code`. The kernel passes the exception class
+/// (ESR_EL1.EC); keep update_excp_stack_bitset in signal.rs in step.
+pub(crate) fn map_err_code(excp: &syscall::Exception) -> (i32, i32) {
     use redox_protocols::flag::*;
-    (SIGABRT, 0 /* todo */)
+    match excp.code & 0x3f {
+        // Instruction or data abort from EL0. TODO: SEGV_ACCERR and SIGBUS
+        // for alignment faults need the fault status code, which the kernel
+        // does not pass.
+        0x20 | 0x24 => (SIGSEGV, 1 /* SEGV_MAPERR */),
+        0x22 | 0x26 => (SIGBUS, 1 /* BUS_ADRALN */), // pc or sp misaligned
+        0x00 => (SIGILL, 1 /* ILL_ILLOPC */),        // unknown reason: undefined instruction
+        0x2c => (SIGFPE, 0 /* todo */),              // trapped floating point exception
+        0x3c => (SIGTRAP, 1 /* TRAP_BRKPT */),       // brk
+        _ => (SIGABRT, 0 /* todo */),
+    }
 }
 pub fn arch_ret_to_sig(stack: &mut SigStack, control: &Sigcontrol) {
     let orig_pc = core::mem::replace(

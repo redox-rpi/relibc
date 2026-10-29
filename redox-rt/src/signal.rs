@@ -31,7 +31,7 @@ pub fn sighandler_function() -> usize {
     __relibc_internal_sigentry as *const () as usize
 }
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
 pub fn excp_handler_function() -> usize {
     __relibc_internal_excpentry as *const () as usize
 }
@@ -605,17 +605,27 @@ fn sigaction_inner(
     let new_first = (handler as u64) | (u64::from(flags.bits() & STORED_FLAGS) << 32);
     action.first.store(new_first, Ordering::Relaxed);
     action.user_data.store(mask, Ordering::Relaxed);
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
     update_excp_stack_bitset(i32::from(signal), flags);
     Ok(())
 }
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
 fn update_excp_stack_bitset(sig_num: i32, flags: SigactionFlags) {
     use redox_protocols::flag::*;
     let onstack = flags.contains(SigactionFlags::ONSTACK);
 
-    // see map_err_code
+    // see map_err_code; aarch64: exception classes (ESR_EL1.EC)
+    #[cfg(target_arch = "aarch64")]
+    let vectors: &[u32] = match sig_num {
+        SIGSEGV => &[0x20, 0x24][..],
+        SIGILL => &[0x00][..],
+        SIGFPE => &[0x2c][..],
+        SIGTRAP => &[0x3c][..],
+        SIGBUS => &[0x22, 0x26][..],
+        _ => &[][..],
+    };
+    #[cfg(not(target_arch = "aarch64"))]
     let vectors: &[u32] = match sig_num {
         SIGSEGV => &[14][..],
         SIGILL => &[6][..],
@@ -826,9 +836,9 @@ pub type RtSigarea = RtTcb; // TODO
 pub fn current_setsighandler_struct() -> SetSighandlerData {
     SetSighandlerData {
         user_handler: sighandler_function(),
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
         excp_handler: excp_handler_function(),
-        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
         excp_handler: 0, // TODO
         thread_control_addr: core::ptr::addr_of!(
             unsafe { Tcb::current() }.unwrap().os_specific.control
