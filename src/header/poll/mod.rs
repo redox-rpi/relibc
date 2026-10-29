@@ -90,30 +90,44 @@ pub fn poll_epoll(fds: &mut [pollfd], timeout: c_int, sigmask: Option<&sigset_t>
         File::new(epfd)
     };
 
-    let mut closed = 0;
-    for (i, fd) in fds.iter_mut().enumerate() {
-        let pfd = fd;
+    // Entries for the same fd share one registration: epoll keeps one per fd
+    // (on Redox a second EPOLL_CTL_ADD replaces the first), so the events of
+    // all entries are combined on the first one and the result is given to
+    // each entry. sshd polls its socket twice, for input and for output.
+    let first_of = |fds: &[pollfd], i: usize| {
+        fds[..i]
+            .iter()
+            .position(|other| other.fd == fds[i].fd)
+            .unwrap_or(i)
+    };
 
-        pfd.revents = 0;
+    let mut closed = 0;
+    for i in 0..fds.len() {
+        fds[i].revents = 0;
 
         // Ignore the entry with negative fd
-        if pfd.fd < 0 {
+        if fds[i].fd < 0 || first_of(fds, i) != i {
             continue;
         }
 
         let mut event = epoll_event::new(0, epoll_data { u64: i as u64 });
 
-        for (p, ep) in event_map.iter() {
-            if pfd.events & p > 0 {
-                event.events |= ep;
+        for pfd in fds[i..].iter().filter(|pfd| pfd.fd == fds[i].fd) {
+            for (p, ep) in event_map.iter() {
+                if pfd.events & p > 0 {
+                    event.events |= ep;
+                }
             }
         }
 
-        match Sys::epoll_ctl(*ep, EPOLL_CTL_ADD, pfd.fd, Some(&mut event)) {
+        match Sys::epoll_ctl(*ep, EPOLL_CTL_ADD, fds[i].fd, Some(&mut event)) {
             Ok(()) => {}
             Err(Errno(EBADF)) => {
-                pfd.revents |= POLLNVAL;
-                closed += 1;
+                let fd = fds[i].fd;
+                for pfd in fds[i..].iter_mut().filter(|pfd| pfd.fd == fd) {
+                    pfd.revents |= POLLNVAL;
+                    closed += 1;
+                }
             }
             Err(Errno(err)) => {
                 ERRNO.set(err);
@@ -136,12 +150,19 @@ pub fn poll_epoll(fds: &mut [pollfd], timeout: c_int, sigmask: Option<&sigset_t>
             for event in events.iter().take(res) {
                 let pi: usize = event.data.into();
                 // TODO: Error status when fd does not match?
-                if let Some(pfd) = fds.get_mut(pi) {
-                    for (p, ep) in event_map.iter() {
-                        if event.events & ep > 0 {
-                            pfd.revents |= p;
-                        }
+                let Some(fd) = fds.get(pi).map(|pfd| pfd.fd) else {
+                    continue;
+                };
+                let mut revents = 0;
+                for (p, ep) in event_map.iter() {
+                    if event.events & ep > 0 {
+                        revents |= p;
                     }
+                }
+                // Each entry gets what it asked for, and the conditions that
+                // are always reported.
+                for pfd in fds[pi..].iter_mut().filter(|pfd| pfd.fd == fd) {
+                    pfd.revents |= revents & (pfd.events | POLLERR | POLLHUP | POLLNVAL);
                 }
             }
         }
