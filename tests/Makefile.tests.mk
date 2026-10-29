@@ -351,7 +351,8 @@ endif
 # Tests that only working with when ld.so exist
 DYNAMIC_ONLY_EXPECT_NAMES=\
 	dlfcn \
-	dlopen_scopes
+	dlopen_scopes \
+	tls_shared
 
 # Tests that may produce different result when ld.so absent
 STATIC_CHECK_EXPECT_NAMES=\

@@ -176,6 +176,10 @@ $(BUILD)/bins_dynamic/dlfcn: dlfcn.c $(BUILD)/bins_dynamic/sharedlib.so $(BUILD)
 	mkdir -p "$$(dirname "$@")"
 	@$(CC) "$<" -o "$@" $(FLAGS) $(DYNAMIC_FLAGS)
 
+$(BUILD)/bins_dynamic/tls_shared: tls_shared.c $(BUILD)/bins_dynamic/libtlsshared.so $(DEPS)
+	mkdir -p "$$(dirname "$@")"
+	@$(CC) "$<" -o "$@" $(FLAGS) $(DYNAMIC_FLAGS) -L $(BUILD)/bins_dynamic -ltlsshared
+
 $(BUILD)/bins_dynamic/dlopen_scopes: dlopen_scopes.c $(BUILD)/bins_dynamic/libfoobar.so $(BUILD)/bins_dynamic/libfoo.so $(DEPS)
 	mkdir -p "$$(dirname "$@")"
 	@$(CC) "$<" -o "$@" $(FLAGS) $(DYNAMIC_FLAGS)
