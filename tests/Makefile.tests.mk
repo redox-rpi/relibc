@@ -362,7 +362,8 @@ STATIC_CHECK_EXPECT_NAMES=\
 	pthread/init_cpp \
 	stdlib/env \
 	unistd/brk \
-	tls
+	tls \
+	tls_align
 
 # Tests run with `expect` (require a .c file and an .exp file
 # that takes the produced binary as the first argument)
