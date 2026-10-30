@@ -332,6 +332,7 @@ VARIED_NAMES=\
 	pthread/mutex_recursive \
 	pthread/timeout \
 	pthread/tls \
+	pthread/cond_stress \
 	grp/getgrouplist \
 	grp/getgroups \
 	grp/getgrgid_r \
